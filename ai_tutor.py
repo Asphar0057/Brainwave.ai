@@ -1,511 +1,303 @@
-# Simple AI Tutor with ChromaDB Memory - VSCode Starter
-# Run this step by step to build your system
+#!/usr/bin/env python3
 
-import chromadb
-import ollama
-import json
-import uuid
-from datetime import datetime
-from typing import List, Dict, Any, Optional
 import os
-import sqlite3
-import re
+import sys
+import asyncio
+import json
+from datetime import datetime
+from typing import Dict, List, Optional
+import logging
 
-# ===================== SETUP =====================
+from database.models import SessionLocal, User, UserInteraction, create_tables
+from agents.math_routing_agent import QueryRouter
+from ml.user_profiler import UserProfiler
+from ml.feedback_learning_system import FeedbackLearningSystem, AdaptiveResponseGenerator
+from utils.memory_manager import MemoryManager
+from utils.session_tracker import SessionTracker
+from utils.metrics_collector import MetricsCollector
 
-def setup_environment():
-    """First-time setup - run this once"""
-    print("Setting up AI Tutor environment...")
-    
-    # Create directories
-    os.makedirs("./ai_tutor_data", exist_ok=True)
-    os.makedirs("./ai_tutor_data/chroma_db", exist_ok=True)
-    
-    print("Directories created")
-    print("Next steps:")
-    print("1. Install dependencies: pip install chromadb")
-    print("2. Make sure Ollama is running: ollama serve")
-    print("3. You already have qwen3 - great!")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ===================== ZERO-KNOWLEDGE LEARNING SYSTEM =====================
-
-class ZeroKnowledgeAITutor:
-    """AI Tutor that starts knowing nothing and learns from every interaction"""
-    
+class BrainwaveAITutor:
     def __init__(self):
-        # Initialize ChromaDB for memory storage
-        self.chroma_client = chromadb.PersistentClient(
-            path="./ai_tutor_data/chroma_db"
-        )
+        self.db = SessionLocal()
+        self.query_router = QueryRouter()
+        self.user_profiler = UserProfiler()
+        self.feedback_system = FeedbackLearningSystem()
+        self.adaptive_generator = AdaptiveResponseGenerator()
+        self.memory_manager = MemoryManager()
+        self.session_tracker = SessionTracker()
+        self.metrics_collector = MetricsCollector()
         
-        # Create user-specific collections (each user gets their own memory)
-        self.user_collections = {}
+        self.active_users = {}
         
-        # Simple user profile storage
-        self.user_db_path = "./ai_tutor_data/users.db"
-        self._init_user_database()
+        create_tables()
+        os.makedirs('models', exist_ok=True)
         
-        # Machine learning adaptation data
-        self.learning_patterns = {}
+    async def initialize_user(self, user_id: str, initial_data: Dict = None) -> Dict:
+        user = self.db.query(User).filter(User.user_id == user_id).first()
         
-        print("Zero-Knowledge AI Tutor initialized")
-        print("Each user starts with blank memory")
-        print("System learns from every interaction")
-    
-    def _init_user_database(self):
-        """Initialize user profiles and learning data"""
-        with sqlite3.connect(self.user_db_path) as conn:
-            # User profiles
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id TEXT PRIMARY KEY,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    total_interactions INTEGER DEFAULT 0,
-                    learning_velocity REAL DEFAULT 0.0,
-                    preferred_response_length TEXT DEFAULT 'medium',
-                    adaptation_score REAL DEFAULT 0.0
-                )
-            """)
-            
-            # Interaction log for machine learning
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS interactions (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT,
-                    question TEXT,
-                    answer TEXT,
-                    user_rating REAL,
-                    response_time REAL,
-                    question_complexity REAL,
-                    answer_length INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    improvement_feedback TEXT
-                )
-            """)
-    
-    def user_exists(self, user_id: str) -> bool:
-        """Check if user has existing data"""
-        try:
-            # Check if user has ChromaDB collection
-            collection_name = f"user_{user_id}_memory"
-            try:
-                collection = self.chroma_client.get_collection(name=collection_name)
-                if collection.count() > 0:
-                    return True
-            except:
-                pass
-            
-            # Check if user has SQL records
-            with sqlite3.connect(self.user_db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT COUNT(*) FROM interactions WHERE user_id = ?
-                """, (user_id,))
-                count = cursor.fetchone()[0]
-                return count > 0
-        except:
-            return False
-    
-    def get_or_create_user_memory(self, user_id: str):
-        """Create personal memory collection for user"""
-        if user_id not in self.user_collections:
-            try:
-                # Each user gets their own ChromaDB collection
-                collection_name = f"user_{user_id}_memory"
-                
-                # Check if this is truly a new user
-                is_new_user = not self.user_exists(user_id)
-                
-                self.user_collections[user_id] = self.chroma_client.get_or_create_collection(
-                    name=collection_name,
-                    metadata={"user_id": user_id, "created": datetime.now().isoformat()}
-                )
-                
-                # Initialize user in database only if new
-                with sqlite3.connect(self.user_db_path) as conn:
-                    conn.execute("""
-                        INSERT OR IGNORE INTO users (user_id) VALUES (?)
-                    """, (user_id,))
-                
-                if is_new_user:
-                    print(f"Created new memory for user: {user_id}")
-                else:
-                    print(f"Loaded existing memory for user: {user_id}")
-                
-            except Exception as e:
-                print(f"Error creating user memory: {e}")
-                return None
-        
-        return self.user_collections[user_id]
-    
-    def simple_embeddings(self, text: str) -> List[float]:
-        """Generate simple embeddings using available models"""
-        try:
-            # Try to use nomic-embed-text directly (don't auto-pull due to encoding issues)
-            response = ollama.embeddings(model="nomic-embed-text", prompt=text)
-            return response['embedding']
-        except:
-            pass
-        
-        try:
-            # Fallback: Use one of your existing models for embeddings
-            response = ollama.embeddings(model="llama3:latest", prompt=text)
-            return response['embedding']
-        except:
-            # Final fallback: create simple hash-based embedding for development
-            import hashlib
-            hash_obj = hashlib.md5(text.encode())
-            # Convert to simple 384-dim vector
-            hash_bytes = hash_obj.hexdigest().encode()
-            return [float(b) / 255.0 for b in hash_bytes[:384]] + [0.0] * (384 - len(hash_bytes))
-    
-    def analyze_user_pattern(self, user_id: str, question: str, feedback: Optional[float] = None):
-        """Machine Learning: Analyze user patterns and adapt"""
-        try:
-            # Get user's interaction history
-            with sqlite3.connect(self.user_db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT question, user_rating, question_complexity, answer_length 
-                    FROM interactions 
-                    WHERE user_id = ? AND user_rating IS NOT NULL
-                    ORDER BY timestamp DESC LIMIT 10
-                """, (user_id,))
-                
-                recent_interactions = cursor.fetchall()
-            
-            if len(recent_interactions) < 3:
-                return "learning"  # Not enough data yet
-            
-            # Calculate learning patterns
-            avg_rating = sum(r[1] for r in recent_interactions) / len(recent_interactions)
-            preferred_complexity = sum(r[2] for r in recent_interactions) / len(recent_interactions)
-            preferred_length = sum(r[3] for r in recent_interactions) / len(recent_interactions)
-            
-            # Adapt response style based on patterns
-            adaptation = {
-                "response_style": "detailed" if preferred_length > 150 else "concise",
-                "complexity_preference": "high" if preferred_complexity > 0.7 else "medium",
-                "satisfaction_trend": "improving" if avg_rating > 3.5 else "needs_adjustment",
-                "adaptation_confidence": min(len(recent_interactions) / 10.0, 1.0)
-            }
-            
-            # Store learning pattern
-            self.learning_patterns[user_id] = adaptation
-            
-            return adaptation
-            
-        except Exception as e:
-            print(f"Error analyzing patterns: {e}")
-            return {"response_style": "medium", "complexity_preference": "medium"}
-    
-    def _clean_response(self, response_text: str) -> str:
-        """Remove thinking tags and clean response"""
-        if not response_text:
-            return "I apologize, but I wasn't able to generate a proper response. Please try asking your question again."
-        
-        # Remove <think>...</think> blocks only
-        cleaned = re.sub(r'<think>.*?</think>\s*', '', response_text, flags=re.DOTALL)
-        
-        # Only remove obvious thinking patterns at the start of lines, not mid-content
-        cleaned = re.sub(r'^\s*Let me think.*?\n', '', cleaned, flags=re.MULTILINE)
-        cleaned = re.sub(r'^\s*I need to think.*?\n', '', cleaned, flags=re.MULTILINE)
-        cleaned = re.sub(r'^\s*Okay, let me.*?\n', '', cleaned, flags=re.MULTILINE)
-        
-        result = cleaned.strip()
-        
-        # Debug: Let's see what we're getting
-        if not result:
-            print(f"DEBUG: Original response: {response_text[:200]}...")
-            print(f"DEBUG: Cleaned response: '{result}'")
-            return "I apologize, but I wasn't able to generate a proper response. Please try asking your question again."
-        
-        return result
-    
-    def chat(self, user_id: str, question: str) -> Dict[str, Any]:
-        """Main chat function - learns from every interaction"""
-        
-        # Get or create user's personal memory
-        user_memory = self.get_or_create_user_memory(user_id)
-        if not user_memory:
-            return {"error": "Could not create user memory"}
-        
-        print(f"\nUser {user_id} asks: {question}")
-        
-        # Step 1: Search user's personal memory for relevant context
-        relevant_context = []
-        try:
-            if user_memory.count() > 0:  # Only search if user has previous conversations
-                query_embedding = self.simple_embeddings(question)
-                
-                memory_results = user_memory.query(
-                    query_embeddings=[query_embedding],
-                    n_results=min(3, user_memory.count())  # Get up to 3 relevant memories
-                )
-                
-                if memory_results['documents'] and memory_results['documents'][0]:
-                    relevant_context = memory_results['documents'][0]
-                    print(f"Found {len(relevant_context)} relevant memories")
-            else:
-                print("No previous memories found")
-        except Exception as e:
-            print(f"Memory search failed: {e}")
-        
-        # Step 2: Get user's learning pattern (ML adaptation)
-        user_pattern = self.analyze_user_pattern(user_id, question)
-        
-        # Step 3: Build adaptive prompt based on user's learning history
-        prompt = self._build_adaptive_prompt(question, relevant_context, user_pattern)
-        
-        # Step 4: Generate response using Qwen3
-        try:
-            start_time = datetime.now()
-            
-            response = ollama.generate(
-                model="qwen3:14b",
-                prompt=prompt,
-                options={
-                    "temperature": 0.4,
-                    "top_p": 0.9,
-                    "stop": ["<think>", "</think>"],  # Stop generation at thinking tags
-                    "num_predict": 300  # Limit response length for faster responses
-                }
+        if not user:
+            user = User(
+                user_id=user_id,
+                created_at=datetime.utcnow(),
+                last_active=datetime.utcnow(),
+                profile_data=initial_data or {},
+                learning_metadata={}
             )
-            
-            # Get the raw response
-            raw_answer = response.get('response', '')
-            response_time = (datetime.now() - start_time).total_seconds()
-            
-            print(f"Generated response in {response_time:.2f}s")
-            print(f"DEBUG: Raw response length: {len(raw_answer)}")
-            print(f"DEBUG: First 300 chars: {raw_answer[:300]}")
-            
-            # Clean the response to remove any thinking tags
-            answer = self._clean_response(raw_answer)
-            
-        except Exception as e:
-            print(f"Error generating response: {e}")
-            return {"error": f"Could not generate response: {e}"}
+            self.db.add(user)
+            self.db.commit()
         
-        # Step 5: Store this interaction as a vector in user's memory
-        interaction_id = self._store_interaction_vector(
-            user_id, user_memory, question, answer, response_time
-        )
+        user_profile = await self.user_profiler.get_or_create_profile(user_id)
         
-        # Step 6: Update user learning metrics
-        self._update_user_metrics(user_id)
+        if initial_data:
+            await self._process_initial_data(user_id, initial_data)
+        
+        self.active_users[user_id] = {
+            'profile': user_profile,
+            'session_start': datetime.utcnow(),
+            'interaction_count': 0
+        }
         
         return {
-            "answer": answer,
-            "interaction_id": interaction_id,
-            "user_memories_count": user_memory.count(),
-            "response_time": response_time,
-            "adaptation_used": user_pattern != "learning",
-            "context_memories": len(relevant_context)
+            'user_id': user_id,
+            'profile': user_profile,
+            'status': 'initialized'
         }
     
-    def _build_adaptive_prompt(self, question: str, context: List[str], pattern: Dict) -> str:
-        """Build prompt that adapts to user's learning pattern"""
+    async def _process_initial_data(self, user_id: str, data: Dict):
+        preferences = {
+            'learning_style': data.get('learning_style', 'balanced'),
+            'difficulty_preference': data.get('difficulty', 'medium'),
+            'subjects_of_interest': data.get('subjects', []),
+            'time_availability': data.get('time_availability', 30)
+        }
         
-        prompt_parts = [
-            "You are an AI tutor that adapts to each student's learning style.",
-            "Respond directly without showing your thinking process.",
-            "Do not use <think> tags or show internal reasoning.",
-            "Give clear, direct answers immediately."
-        ]
-        
-        # Add user's learning pattern adaptation
-        if isinstance(pattern, dict):
-            if pattern.get("response_style") == "concise":
-                prompt_parts.append("Keep responses brief and to the point.")
-            elif pattern.get("response_style") == "detailed":
-                prompt_parts.append("Provide detailed explanations with examples.")
-            
-            if pattern.get("complexity_preference") == "high":
-                prompt_parts.append("Use advanced concepts and terminology.")
-            else:
-                prompt_parts.append("Keep explanations simple and accessible.")
-        
-        # Add relevant memory context
-        if context:
-            prompt_parts.append("\nRelevant previous conversations:")
-            for i, memory in enumerate(context[:2]):  # Limit to 2 memories
-                prompt_parts.append(f"{i+1}. {memory[:200]}...")
-        
-        # Add current question
-        prompt_parts.append(f"\nStudent question: {question}")
-        prompt_parts.append("\nProvide a helpful, educational response:")
-        
-        return "\n".join(prompt_parts)
+        await self.user_profiler.update_preferences(user_id, preferences)
     
-    def _store_interaction_vector(self, user_id: str, user_memory, question: str, answer: str, response_time: float) -> str:
-        """Store interaction as vector in ChromaDB"""
-        try:
-            interaction_id = str(uuid.uuid4())
-            
-            # Create combined text for embedding
-            combined_text = f"Question: {question}\nAnswer: {answer}"
-            
-            # Generate embedding
-            embedding = self.simple_embeddings(combined_text)
-            
-            # Store in user's personal ChromaDB collection
-            user_memory.add(
-                embeddings=[embedding],
-                documents=[combined_text],
-                metadatas=[{
-                    "user_id": user_id,
-                    "question": question[:100],  # Truncated for metadata
-                    "timestamp": datetime.now().isoformat(),
-                    "response_time": response_time,
-                    "answer_length": len(answer)
-                }],
-                ids=[interaction_id]
-            )
-            
-            # Also store in SQL for structured analysis
-            with sqlite3.connect(self.user_db_path) as conn:
-                conn.execute("""
-                    INSERT INTO interactions 
-                    (id, user_id, question, answer, response_time, question_complexity, answer_length)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    interaction_id, user_id, question, answer, response_time,
-                    len(question.split()) / 10.0,  # Simple complexity measure
-                    len(answer)
-                ))
-            
-            print(f"Stored interaction vector: {interaction_id}")
-            return interaction_id
-            
-        except Exception as e:
-            print(f"Error storing interaction: {e}")
-            return ""
+    async def process_query(self, user_id: str, query: str) -> Dict:
+        if user_id not in self.active_users:
+            await self.initialize_user(user_id)
+        
+        session_id = self.session_tracker.get_or_create_session(user_id)
+        user_profile = self.active_users[user_id]['profile']
+        
+        start_time = datetime.utcnow()
+        
+        routing_response = await self.query_router.route_query(query, user_id, user_profile)
+        
+        relevant_memories = await self.memory_manager.retrieve_relevant_memories(
+            user_id, query, limit=5
+        )
+        
+        context = {
+            'base_response': routing_response['response'],
+            'query_type': routing_response['query_type'],
+            'model_used': routing_response['model_used'],
+            'memories': relevant_memories,
+            'user_profile': user_profile
+        }
+        
+        adaptive_response = await self.adaptive_generator.generate_adaptive_response(
+            query, user_id, context
+        )
+        
+        interaction_id = await self._store_interaction(
+            user_id, session_id, query, adaptive_response['response'], routing_response, context
+        )
+        
+        await self.memory_manager.store_interaction(
+            user_id, query, adaptive_response['response'], context, {
+                'session_id': session_id,
+                'interaction_id': interaction_id,
+                'model_used': routing_response['model_used']
+            }
+        )
+        
+        self.active_users[user_id]['interaction_count'] += 1
+        
+        return {
+            'response': adaptive_response['response'],
+            'interaction_id': interaction_id,
+            'model_used': routing_response['model_used'],
+            'query_type': routing_response['query_type'],
+            'confidence': routing_response['confidence'],
+            'adaptations': adaptive_response.get('adaptations_applied', {}),
+            'session_id': session_id
+        }
     
-    def _update_user_metrics(self, user_id: str):
-        """Update user learning metrics"""
-        try:
-            with sqlite3.connect(self.user_db_path) as conn:
-                conn.execute("""
-                    UPDATE users 
-                    SET total_interactions = total_interactions + 1
-                    WHERE user_id = ?
-                """, (user_id,))
-        except Exception as e:
-            print(f"Error updating metrics: {e}")
+    async def _store_interaction(self, user_id: str, session_id: str, query: str, 
+                                response: str, routing_data: Dict, context: Dict) -> int:
+        interaction = UserInteraction(
+            user_id=user_id,
+            session_id=session_id,
+            timestamp=datetime.utcnow(),
+            interaction_type=routing_data['query_type'],
+            user_input=query,
+            ai_response=response,
+            topic=routing_data.get('subjects', ['general'])[0],
+            complexity_level=routing_data.get('difficulty', 'medium'),
+            response_time=routing_data.get('response_time', 0),
+            context_data={
+                'model_used': routing_data['model_used'],
+                'confidence': routing_data['confidence'],
+                'memories_used': len(context.get('memories', []))
+            }
+        )
+        
+        self.db.add(interaction)
+        self.db.commit()
+        
+        return interaction.id
     
-    def provide_feedback(self, user_id: str, interaction_id: str, rating: float, feedback_text: str = ""):
-        """Machine Learning: User provides feedback to improve system"""
-        try:
-            with sqlite3.connect(self.user_db_path) as conn:
-                conn.execute("""
-                    UPDATE interactions 
-                    SET user_rating = ?, improvement_feedback = ?
-                    WHERE id = ? AND user_id = ?
-                """, (rating, feedback_text, interaction_id, user_id))
-            
-            # Re-analyze user patterns with new feedback
-            self.analyze_user_pattern(user_id, "", rating)
-            
-            print(f"Feedback recorded: {rating}/5.0")
-            print("User pattern analysis updated")
-            
-        except Exception as e:
-            print(f"Error recording feedback: {e}")
+    async def submit_feedback(self, user_id: str, interaction_id: int, feedback: Dict) -> Dict:
+        interaction = self.db.query(UserInteraction).filter(
+            UserInteraction.id == interaction_id
+        ).first()
+        
+        if not interaction:
+            return {'status': 'error', 'message': 'Interaction not found'}
+        
+        interaction.user_rating = feedback.get('rating')
+        interaction.feedback_data = feedback
+        self.db.commit()
+        
+        await self.feedback_system.process_user_feedback(user_id, interaction_id, feedback)
+        
+        await self.user_profiler.update_profile_from_feedback(user_id, feedback)
+        
+        if feedback.get('rating', 0) >= 4:
+            await self.memory_manager.mark_interaction_as_successful(user_id, interaction_id)
+        
+        return {'status': 'success', 'message': 'Feedback processed'}
     
-    def get_user_stats(self, user_id: str) -> Dict:
-        """Get user's learning statistics"""
-        try:
-            user_memory = self.get_or_create_user_memory(user_id)
-            
-            with sqlite3.connect(self.user_db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT 
-                        total_interactions,
-                        AVG(user_rating) as avg_rating,
-                        AVG(response_time) as avg_response_time,
-                        COUNT(CASE WHEN user_rating >= 4 THEN 1 END) as high_ratings
-                    FROM users u
-                    LEFT JOIN interactions i ON u.user_id = i.user_id
-                    WHERE u.user_id = ?
-                """, (user_id,))
-                
-                row = cursor.fetchone()
-                
-                return {
-                    "total_memories": user_memory.count() if user_memory else 0,
-                    "total_interactions": row[0] or 0,
-                    "average_rating": round(row[1] or 0, 2),
-                    "average_response_time": round(row[2] or 0, 2),
-                    "high_quality_responses": row[3] or 0,
-                    "learning_pattern": self.learning_patterns.get(user_id, "still_learning")
-                }
-        except Exception as e:
-            print(f"Error getting stats: {e}")
-            return {}
+    async def get_user_analytics(self, user_id: str) -> Dict:
+        analytics = await self.metrics_collector.get_user_analytics(user_id)
+        
+        user_profile = await self.user_profiler.get_profile(user_id)
+        performance_metrics = await self.user_profiler.get_performance_metrics(user_id)
+        
+        return {
+            'profile': user_profile,
+            'performance': performance_metrics,
+            'metrics': analytics,
+            'recommendations': await self._generate_recommendations(user_id, analytics)
+        }
+    
+    async def _generate_recommendations(self, user_id: str, analytics: Dict) -> List[str]:
+        recommendations = []
+        
+        overall_performance = analytics.get('performance', {}).get('average', 0.5)
+        if overall_performance < 0.4:
+            recommendations.append("Consider reviewing fundamental concepts")
+        
+        engagement = analytics.get('engagement', {}).get('average', 0.5)
+        if engagement < 0.4:
+            recommendations.append("Try varying your study approach for better engagement")
+        
+        math_prefs = await self.feedback_system.get_user_routing_preferences(user_id)
+        if math_prefs['math_model_preference'] < 0.3:
+            recommendations.append("Focus on building stronger math fundamentals")
+        
+        return recommendations
+    
+    def cleanup_user_session(self, user_id: str):
+        if user_id in self.active_users:
+            self.session_tracker.end_session(user_id)
+            del self.active_users[user_id]
 
-# ===================== SIMPLE CLI INTERFACE =====================
-
-def main():
-    """Simple command-line interface to test the system"""
+async def main():
+    tutor = BrainwaveAITutor()
     
-    print("Zero-Knowledge AI Tutor - Starting Fresh")
-    print("=" * 50)
-    
-    # Initialize the AI tutor
-    tutor = ZeroKnowledgeAITutor()
-    
-    # Get user ID
-    user_id = input("Enter your user ID (e.g., 'student1'): ").strip()
-    if not user_id:
-        user_id = "test_user"
-    
-    # Check if user has existing data
-    if tutor.user_exists(user_id):
-        stats = tutor.get_user_stats(user_id)
-        print(f"\nWelcome back {user_id}! I have {stats.get('total_memories', 0)} memories of our conversations.")
-        print("I'll continue learning your preferences from our interactions.")
-    else:
-        print(f"\nHello {user_id}! I'm starting with zero knowledge about you.")
-        print("I'll learn your preferences from our conversations.")
-    
-    print("Type 'quit' to exit, 'stats' to see your learning data\n")
+    print("Brainwave AI Tutor System")
+    print("=" * 40)
+    print("Features:")
+    print("- HuggingFace DialoGPT for general questions")
+    print("- WizardMath for mathematical problems")
+    print("- Machine Learning personalization")
+    print("- Memory and feedback learning")
+    print("=" * 40)
     
     while True:
-        # Get user question
-        question = input(f"{user_id}: ").strip()
+        print("\nOptions:")
+        print("1. Initialize User")
+        print("2. Ask Question")
+        print("3. Submit Feedback")
+        print("4. View Analytics")
+        print("5. Exit")
         
-        if question.lower() == 'quit':
+        choice = input("\nSelect option: ").strip()
+        
+        if choice == '1':
+            user_id = input("Enter user ID: ")
+            learning_style = input("Learning style (visual/auditory/kinesthetic/reading): ") or "balanced"
+            subjects = input("Subjects of interest (comma-separated): ").split(',')
+            difficulty = input("Preferred difficulty (easy/medium/hard): ") or "medium"
+            
+            initial_data = {
+                'learning_style': learning_style,
+                'subjects': [s.strip() for s in subjects if s.strip()],
+                'difficulty': difficulty,
+                'time_availability': 30
+            }
+            
+            result = await tutor.initialize_user(user_id, initial_data)
+            print(f"User initialized: {result}")
+            
+        elif choice == '2':
+            user_id = input("Enter user ID: ")
+            question = input("Enter your question: ")
+            
+            result = await tutor.process_query(user_id, question)
+            
+            print(f"\nAI Tutor ({result['model_used']}): {result['response']}")
+            print(f"Query Type: {result['query_type']}")
+            print(f"Confidence: {result['confidence']:.2f}")
+            
+            rating = input("\nRate this response (1-5): ")
+            if rating.isdigit():
+                feedback = {
+                    'rating': int(rating),
+                    'helpful': int(rating) >= 4,
+                    'clarity': int(rating),
+                    'accuracy': int(rating)
+                }
+                await tutor.submit_feedback(user_id, result['interaction_id'], feedback)
+                print("Feedback recorded!")
+                
+        elif choice == '3':
+            user_id = input("Enter user ID: ")
+            interaction_id = input("Enter interaction ID: ")
+            rating = input("Rating (1-5): ")
+            helpful = input("Was it helpful? (y/n): ").lower() == 'y'
+            text_feedback = input("Additional feedback (optional): ")
+            
+            feedback = {
+                'rating': int(rating) if rating.isdigit() else 3,
+                'helpful': helpful,
+                'clarity': int(rating) if rating.isdigit() else 3,
+                'accuracy': int(rating) if rating.isdigit() else 3,
+                'text_feedback': text_feedback
+            }
+            
+            result = await tutor.submit_feedback(user_id, int(interaction_id), feedback)
+            print(f"Feedback result: {result}")
+            
+        elif choice == '4':
+            user_id = input("Enter user ID: ")
+            analytics = await tutor.get_user_analytics(user_id)
+            
+            print(f"\nAnalytics for {user_id}:")
+            print(f"Profile: {analytics['profile']}")
+            print(f"Performance: {analytics['performance']}")
+            print(f"Recommendations: {analytics['recommendations']}")
+            
+        elif choice == '5':
+            print("Goodbye!")
             break
-        elif question.lower() == 'stats':
-            stats = tutor.get_user_stats(user_id)
-            print(f"\nYour Learning Stats:")
-            for key, value in stats.items():
-                print(f"  {key}: {value}")
-            print()
-            continue
-        elif not question:
-            continue
-        
-        # Generate response
-        result = tutor.chat(user_id, question)
-        
-        if "error" in result:
-            print(f"Error: {result['error']}\n")
-            continue
-        
-        # Display response
-        print(f"\nAI Tutor: {result['answer']}")
-        print(f"Memories: {result['user_memories_count']} | Response time: {result['response_time']:.2f}s")
-        
-        # Get feedback
-        feedback = input("\nRate this response (1-5) or press Enter to skip: ").strip()
-        if feedback.isdigit() and 1 <= int(feedback) <= 5:
-            tutor.provide_feedback(user_id, result['interaction_id'], float(feedback))
-        
-        print("\n" + "-" * 30 + "\n")
+        else:
+            print("Invalid option")
 
 if __name__ == "__main__":
-    # First run setup if needed
-    setup_environment()
-    
-    # Start the main application
-    main()
+    asyncio.run(main())
