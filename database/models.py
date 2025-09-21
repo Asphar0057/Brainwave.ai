@@ -20,7 +20,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_active = Column(DateTime, default=datetime.utcnow)
     profile_data = Column(JSON, default={})
-    learning_metadata = Column(JSON, default={})
+    learning_data = Column(JSON, default={})
     subscription_tier = Column(String, default="free")
     is_active = Column(Boolean, default=True)
     
@@ -52,7 +52,7 @@ class LearningSession(Base):
     end_time = Column(DateTime, nullable=True)
     topic_focus = Column(String, nullable=True)
     interaction_count = Column(Integer, default=0)
-    session_metadata = Column(JSON, default={})
+    session_data = Column(JSON, default={})
     performance_score = Column(Float, nullable=True)
     engagement_score = Column(Float, nullable=True)
     
@@ -108,7 +108,7 @@ class KnowledgeBase(Base):
     difficulty_level = Column(String)
     content_type = Column(String)
     tags = Column(JSON, default=[])
-    metadata = Column(JSON, default={})
+    content_metadata = Column(JSON, default={})
     embedding_vector = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
