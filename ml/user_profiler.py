@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import joblib
 import json
@@ -18,7 +18,7 @@ class UserProfiler:
         self.scaler = StandardScaler()
         self.learning_style_classifier = None
         self.difficulty_predictor = None
-        self.engagement_model = None
+        self.engagement_model = None  # Changed to regressor
         
         self.feature_extractors = {
             'behavioral': self._extract_behavioral_features,
@@ -42,14 +42,17 @@ class UserProfiler:
             self.learning_style_classifier = joblib.load('models/learning_style_classifier.pkl')
             self.difficulty_predictor = joblib.load('models/difficulty_predictor.pkl')
             self.engagement_model = joblib.load('models/engagement_model.pkl')
+            logger.info("Loaded existing profiling models")
         except FileNotFoundError:
             logger.info("Pre-trained models not found. Will train new models.")
             self._train_initial_models()
     
     def _train_initial_models(self):
+        # Use classifier for discrete categories
         self.learning_style_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
         self.difficulty_predictor = RandomForestClassifier(n_estimators=100, random_state=42)
-        self.engagement_model = RandomForestClassifier(n_estimators=100, random_state=42)
+        # Use regressor for continuous engagement values
+        self.engagement_model = RandomForestRegressor(n_estimators=100, random_state=42)
         
         synthetic_data = self._generate_synthetic_training_data()
         self._train_models_with_data(synthetic_data)
@@ -139,12 +142,16 @@ class UserProfiler:
     async def _extract_behavioral_features(self, user_id: str, interaction_data: Dict = None) -> Dict:
         features = {}
         
-        interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == user_id
-        ).order_by(UserInteraction.timestamp.desc()).limit(50).all()
+        try:
+            interactions = self.db.query(UserInteraction).filter(
+                UserInteraction.user_id == user_id
+            ).order_by(UserInteraction.timestamp.desc()).limit(50).all()
+        except Exception as e:
+            logger.error(f"Database error in behavioral features: {e}")
+            return self._default_behavioral_features()
         
         if not interactions:
-            return {'avg_engagement': 0.5, 'engagement_trend': 'stable'}
+            return self._default_behavioral_features()
         
         engagement_scores = []
         for interaction in interactions:
@@ -159,7 +166,7 @@ class UserProfiler:
                 elif interaction.response_time > 120:
                     score -= 0.1
             
-            if 'follow up' in interaction.user_input.lower() or 'also' in interaction.user_input.lower():
+            if interaction.user_input and ('follow up' in interaction.user_input.lower() or 'also' in interaction.user_input.lower()):
                 score += 0.15
             
             engagement_scores.append(max(0.0, min(1.0, score)))
@@ -190,6 +197,9 @@ class UserProfiler:
             if hour not in hour_engagement:
                 hour_engagement[hour] = []
             hour_engagement[hour].append(rating)
+        
+        if not hour_engagement:
+            return [14, 16, 19]  # Default peak hours
         
         avg_by_hour = {hour: np.mean(ratings) for hour, ratings in hour_engagement.items()}
         sorted_hours = sorted(avg_by_hour.items(), key=lambda x: x[1], reverse=True)
@@ -224,71 +234,16 @@ class UserProfiler:
         
         return factors
     
-    async def continuous_profile_update(self, user_id: str):
-        recent_interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == user_id,
-            UserInteraction.timestamp >= datetime.utcnow() - timedelta(days=7)
-        ).all()
-        
-        if not recent_interactions:
-            return
-        
-        aggregated_features = await self._extract_aggregated_features(user_id, recent_interactions)
-        
-        current_profile = await self.get_profile(user_id)
-        updated_profile = await self._update_profile_with_aggregated_data(
-            current_profile, aggregated_features
-        )
-        
-        await self._save_profile(user_id, updated_profile)
-    
-    
-    async def _update_profile_with_aggregated_data(self, current_profile: Dict, aggregated_features: Dict) -> Dict:
-        predictions = await self._update_predictions(current_profile, aggregated_features, {})
-        return self._merge_profile_updates(current_profile, predictions)
-    
-    async def _extract_aggregated_features(self, user_id: str, interactions) -> Dict:
-        features = {}
-        
-        if not interactions:
-            return self._default_behavioral_features()
-        
-        response_times = [i.response_time for i in interactions if i.response_time]
-        if response_times:
-            features['avg_response_time'] = np.mean(response_times)
-            features['response_time_variability'] = np.std(response_times)
-        
-        complexity_levels = [i.complexity_level for i in interactions if i.complexity_level]
-        if complexity_levels:
-            features['preferred_complexity'] = max(set(complexity_levels), key=complexity_levels.count)
-            features['complexity_diversity'] = len(set(complexity_levels)) / len(complexity_levels)
-        
-        features['total_interactions'] = len(interactions)
-        features['avg_session_length'] = self._calculate_avg_session_length(interactions)
-        features['question_type_distribution'] = self._analyze_question_types(interactions)
-        
-        features['help_frequency'] = len([i for i in interactions if 'help' in i.user_input.lower()]) / len(interactions)
-        features['clarification_requests'] = len([i for i in interactions if any(word in i.user_input.lower() for word in ['clarify', 'explain again', 'don\'t understand'])])
-        
-        follow_up_count = 0
-        for i, interaction in enumerate(interactions[:-1]):
-            if interactions[i+1].topic == interaction.topic:
-                follow_up_count += 1
-        features['topic_persistence'] = follow_up_count / max(1, len(interactions) - 1)
-        
-        features.update(await self._extract_behavioral_features(user_id))
-        features.update(await self._extract_performance_features(user_id))
-        features.update(await self._extract_temporal_features(user_id))
-        features.update(await self._extract_content_features(user_id))
-        
-        return features
-    
     async def _extract_performance_features(self, user_id: str, interaction_data: Dict = None) -> Dict:
         features = {}
         
-        interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == user_id
-        ).order_by(UserInteraction.timestamp.desc()).limit(100).all()
+        try:
+            interactions = self.db.query(UserInteraction).filter(
+                UserInteraction.user_id == user_id
+            ).order_by(UserInteraction.timestamp.desc()).limit(100).all()
+        except Exception as e:
+            logger.error(f"Database error in performance features: {e}")
+            return self._default_performance_features()
         
         if not interactions:
             return self._default_performance_features()
@@ -298,6 +253,10 @@ class UserProfiler:
             features['avg_rating'] = np.mean(ratings)
             features['rating_trend'] = self._calculate_trend(ratings)
             features['rating_consistency'] = 1.0 - (np.std(ratings) / 5.0)
+        else:
+            features['avg_rating'] = 3.0
+            features['rating_trend'] = 0.0
+            features['rating_consistency'] = 0.5
         
         topic_performance = {}
         for interaction in interactions:
@@ -315,15 +274,21 @@ class UserProfiler:
             recent_performance = np.mean(ratings[-5:])
             early_performance = np.mean(ratings[:5])
             features['learning_improvement'] = (recent_performance - early_performance) / 5.0
+        else:
+            features['learning_improvement'] = 0.0
         
         return features
     
     async def _extract_temporal_features(self, user_id: str, interaction_data: Dict = None) -> Dict:
         features = {}
         
-        interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == user_id
-        ).order_by(UserInteraction.timestamp.asc()).all()
+        try:
+            interactions = self.db.query(UserInteraction).filter(
+                UserInteraction.user_id == user_id
+            ).order_by(UserInteraction.timestamp.asc()).all()
+        except Exception as e:
+            logger.error(f"Database error in temporal features: {e}")
+            return self._default_temporal_features()
         
         if len(interactions) < 2:
             return self._default_temporal_features()
@@ -336,25 +301,35 @@ class UserProfiler:
         if time_gaps:
             features['avg_time_between_interactions'] = np.mean(time_gaps)
             features['interaction_regularity'] = 1.0 / (1.0 + np.std(time_gaps))
+        else:
+            features['avg_time_between_interactions'] = 24.0
+            features['interaction_regularity'] = 0.5
         
         hours = [interaction.timestamp.hour for interaction in interactions]
-        features['preferred_study_time'] = max(set(hours), key=hours.count)
-        features['time_consistency'] = len(set(hours)) / 24.0
+        features['preferred_study_time'] = max(set(hours), key=hours.count) if hours else 14
+        features['time_consistency'] = len(set(hours)) / 24.0 if hours else 0.5
         
         sessions = self._identify_study_sessions(interactions)
         if sessions:
             session_lengths = [len(session) for session in sessions]
             features['avg_session_interactions'] = np.mean(session_lengths)
-            features['session_consistency'] = 1.0 - (np.std(session_lengths) / np.mean(session_lengths))
+            features['session_consistency'] = 1.0 - (np.std(session_lengths) / np.mean(session_lengths)) if np.mean(session_lengths) > 0 else 0.5
+        else:
+            features['avg_session_interactions'] = 5
+            features['session_consistency'] = 0.5
         
         return features
     
     async def _extract_content_features(self, user_id: str, interaction_data: Dict = None) -> Dict:
         features = {}
         
-        interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == user_id
-        ).order_by(UserInteraction.timestamp.desc()).limit(100).all()
+        try:
+            interactions = self.db.query(UserInteraction).filter(
+                UserInteraction.user_id == user_id
+            ).order_by(UserInteraction.timestamp.desc()).limit(100).all()
+        except Exception as e:
+            logger.error(f"Database error in content features: {e}")
+            return self._default_content_features()
         
         if not interactions:
             return self._default_content_features()
@@ -363,11 +338,14 @@ class UserProfiler:
         if response_lengths:
             features['preferred_response_length'] = np.mean(response_lengths)
             features['length_tolerance'] = np.std(response_lengths)
+        else:
+            features['preferred_response_length'] = 500
+            features['length_tolerance'] = 200
         
         topics = [i.topic for i in interactions if i.topic]
         unique_topics = set(topics)
-        features['topic_diversity_score'] = len(unique_topics) / max(1, len(topics))
-        features['topic_focus_distribution'] = {topic: topics.count(topic) / len(topics) for topic in unique_topics}
+        features['topic_diversity_score'] = len(unique_topics) / max(1, len(topics)) if topics else 0.5
+        features['topic_focus_distribution'] = {topic: topics.count(topic) / len(topics) for topic in unique_topics} if topics else {}
         
         complexity_progression = []
         for interaction in interactions:
@@ -377,6 +355,8 @@ class UserProfiler:
         
         if len(complexity_progression) > 1:
             features['complexity_trend'] = self._calculate_trend(complexity_progression)
+        else:
+            features['complexity_trend'] = 0.0
         
         return features
     
@@ -389,30 +369,39 @@ class UserProfiler:
             features['current_complexity'] = interaction_data.get('complexity_level', 'medium')
             features['current_rating'] = interaction_data.get('user_rating', 0)
         
-        recent_interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == user_id,
-            UserInteraction.timestamp >= datetime.utcnow() - timedelta(days=7)
-        ).all()
+        try:
+            recent_interactions = self.db.query(UserInteraction).filter(
+                UserInteraction.user_id == user_id,
+                UserInteraction.timestamp >= datetime.utcnow() - timedelta(days=7)
+            ).all()
+        except Exception as e:
+            logger.error(f"Database error in interaction features: {e}")
+            recent_interactions = []
         
         if recent_interactions:
             features['recent_interaction_count'] = len(recent_interactions)
-            features['recent_avg_rating'] = np.mean([i.user_rating for i in recent_interactions if i.user_rating])
-            features['recent_topic_focus'] = max([i.topic for i in recent_interactions if i.topic], 
-                                               key=[i.topic for i in recent_interactions if i.topic].count) if recent_interactions else None
+            ratings = [i.user_rating for i in recent_interactions if i.user_rating]
+            features['recent_avg_rating'] = np.mean(ratings) if ratings else 3.0
+            topics = [i.topic for i in recent_interactions if i.topic]
+            features['recent_topic_focus'] = max(topics, key=topics.count) if topics else None
+        else:
+            features['recent_interaction_count'] = 0
+            features['recent_avg_rating'] = 3.0
+            features['recent_topic_focus'] = None
         
         return features
     
     def _default_behavioral_features(self) -> Dict:
         return {
-            'avg_response_time': 30.0,
-            'response_time_variability': 10.0,
-            'preferred_complexity': 'medium',
-            'complexity_diversity': 0.5,
-            'total_interactions': 0,
-            'avg_session_length': 5,
-            'help_frequency': 0.1,
-            'clarification_requests': 0,
-            'topic_persistence': 0.3
+            'avg_engagement': 0.5,
+            'engagement_trend': 'stable',
+            'peak_engagement_times': [14, 16, 19],
+            'engagement_factors': {
+                'prefers_short_responses': False,
+                'prefers_examples': False,
+                'prefers_detailed_explanations': False,
+                'responds_well_to_encouragement': False
+            }
         }
     
     def _default_performance_features(self) -> Dict:
@@ -451,12 +440,6 @@ class UserProfiler:
         trend = np.polyfit(x, values, 1)[0]
         return trend
     
-    def _calculate_avg_session_length(self, interactions) -> float:
-        sessions = self._identify_study_sessions(interactions)
-        if not sessions:
-            return 5.0
-        return np.mean([len(session) for session in sessions])
-    
     def _identify_study_sessions(self, interactions) -> List[List]:
         if not interactions:
             return []
@@ -476,32 +459,23 @@ class UserProfiler:
         sessions.append(current_session)
         return sessions
     
-    def _analyze_question_types(self, interactions) -> Dict:
-        question_types = {}
-        for interaction in interactions:
-            q_type = interaction.interaction_type or 'general'
-            question_types[q_type] = question_types.get(q_type, 0) + 1
-        
-        total = sum(question_types.values())
-        return {k: v/total for k, v in question_types.items()} if total > 0 else {}
-    
     async def _update_predictions(self, current_profile: Dict, features: Dict, interaction_data: Dict) -> Dict:
         predictions = {}
         
-        feature_vector = self._prepare_feature_vector(features)
-        
         try:
-            if hasattr(self.learning_style_classifier, 'predict_proba'):
+            feature_vector = self._prepare_feature_vector(features)
+            
+            if hasattr(self.learning_style_classifier, 'predict_proba') and self.learning_style_classifier is not None:
                 style_probs = self.learning_style_classifier.predict_proba([feature_vector])[0]
                 styles = ['visual', 'auditory', 'kinesthetic', 'reading']
                 predictions['learning_style'] = styles[np.argmax(style_probs)]
                 predictions['learning_style_confidence'] = np.max(style_probs)
             
-            if hasattr(self.difficulty_predictor, 'predict'):
+            if hasattr(self.difficulty_predictor, 'predict') and self.difficulty_predictor is not None:
                 difficulty_pred = self.difficulty_predictor.predict([feature_vector])[0]
                 predictions['difficulty_preference'] = difficulty_pred
             
-            if hasattr(self.engagement_model, 'predict'):
+            if hasattr(self.engagement_model, 'predict') and self.engagement_model is not None:
                 engagement_pred = self.engagement_model.predict([feature_vector])[0]
                 predictions['engagement_level'] = max(0.0, min(1.0, engagement_pred))
         
@@ -514,54 +488,54 @@ class UserProfiler:
     def _prepare_feature_vector(self, features: Dict) -> List[float]:
         vector = []
         
-        vector.append(features.get('avg_response_time', 30.0))
-        vector.append(features.get('response_time_variability', 10.0))
-        vector.append(features.get('complexity_diversity', 0.5))
-        vector.append(features.get('help_frequency', 0.1))
-        vector.append(features.get('topic_persistence', 0.3))
-        
-        vector.append(features.get('avg_rating', 3.0))
+        vector.append(features.get('avg_engagement', 0.5))
+        vector.append(features.get('avg_rating', 3.0) / 5.0)  # Normalize to 0-1
         vector.append(features.get('rating_consistency', 0.5))
         vector.append(features.get('learning_improvement', 0.0))
-        
         vector.append(features.get('interaction_regularity', 0.5))
         vector.append(features.get('time_consistency', 0.5))
-        
-        vector.append(features.get('preferred_response_length', 500) / 1000.0)
+        vector.append(features.get('preferred_response_length', 500) / 1000.0)  # Normalize
         vector.append(features.get('topic_diversity_score', 0.5))
+        vector.append(features.get('complexity_trend', 0.0))
+        vector.append(features.get('recent_interaction_count', 0) / 50.0)  # Normalize
+        vector.append(features.get('recent_avg_rating', 3.0) / 5.0)  # Normalize
+        vector.append(float(features.get('preferred_study_time', 14)) / 24.0)  # Normalize hour
         
         return vector
     
     def _rule_based_predictions(self, features: Dict, interaction_data: Dict) -> Dict:
         predictions = {}
         
-        help_freq = features.get('help_frequency', 0.1)
-        topic_persistence = features.get('topic_persistence', 0.3)
+        avg_engagement = features.get('avg_engagement', 0.5)
         response_length_pref = features.get('preferred_response_length', 500)
+        avg_rating = features.get('avg_rating', 3.0)
         
+        # Learning style prediction based on features
         if response_length_pref < 300:
             predictions['learning_style'] = 'visual'
-        elif help_freq > 0.2:
+        elif avg_engagement > 0.7:
             predictions['learning_style'] = 'auditory'
-        elif topic_persistence > 0.5:
+        elif features.get('topic_diversity_score', 0.5) > 0.6:
             predictions['learning_style'] = 'kinesthetic'
         else:
             predictions['learning_style'] = 'reading'
         
-        avg_rating = features.get('avg_rating', 3.0)
-        complexity_diversity = features.get('complexity_diversity', 0.5)
+        # Difficulty preference
+        rating_trend = features.get('rating_trend', 0.0)
+        complexity_trend = features.get('complexity_trend', 0.0)
         
-        if avg_rating > 4.0 and complexity_diversity > 0.6:
+        if avg_rating > 4.0 and complexity_trend > 0:
             predictions['difficulty_preference'] = 'hard'
-        elif avg_rating < 3.0:
+        elif avg_rating < 3.0 or rating_trend < -0.1:
             predictions['difficulty_preference'] = 'easy'
         else:
             predictions['difficulty_preference'] = 'medium'
         
+        # Engagement level
         interaction_regularity = features.get('interaction_regularity', 0.5)
         rating_consistency = features.get('rating_consistency', 0.5)
         
-        predictions['engagement_level'] = (interaction_regularity + rating_consistency) / 2.0
+        predictions['engagement_level'] = (avg_engagement + interaction_regularity + rating_consistency) / 3.0
         
         return predictions
     
@@ -635,9 +609,12 @@ class UserProfiler:
         return updated
     
     async def _load_existing_profile(self, user_id: str) -> Optional[Dict]:
-        user = self.db.query(User).filter(User.user_id == user_id).first()
-        if user and user.profile_data:
-            return user.profile_data
+        try:
+            user = self.db.query(User).filter(User.user_id == user_id).first()
+            if user and user.profile_data:
+                return user.profile_data
+        except Exception as e:
+            logger.error(f"Error loading profile for user {user_id}: {e}")
         return None
     
     async def _save_profile(self, user_id: str, profile: Dict):
