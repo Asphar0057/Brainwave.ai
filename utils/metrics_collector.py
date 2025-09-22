@@ -96,6 +96,159 @@ class MetricsCollector:
         
         return 0.5
     
+    # Missing methods that need to be implemented
+    async def _calculate_engagement_metrics(self, user_id: str, days_back: int = 30) -> Dict:
+        """Calculate engagement metrics for a user"""
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+        
+        interactions = self.db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id,
+            UserInteraction.timestamp >= cutoff_date
+        ).all()
+        
+        if not interactions:
+            return {'average': 0.5, 'trend': 'stable', 'total_sessions': 0}
+        
+        engagement_scores = []
+        for interaction in interactions:
+            score = self._calculate_engagement_score(
+                interaction.user_input or '',
+                {'confidence_score': 0.5},
+                {'topic': interaction.topic}
+            )
+            engagement_scores.append(score)
+        
+        avg_engagement = np.mean(engagement_scores)
+        trend = self._calculate_trend(engagement_scores)
+        
+        return {
+            'average': avg_engagement,
+            'trend': 'improving' if trend > 0.1 else 'declining' if trend < -0.1 else 'stable',
+            'total_sessions': len(interactions),
+            'peak_engagement': max(engagement_scores),
+            'low_engagement': min(engagement_scores)
+        }
+    
+    async def _calculate_performance_metrics(self, user_id: str, days_back: int = 30) -> Dict:
+        """Calculate performance metrics for a user"""
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+        
+        metrics = self.db.query(PerformanceMetric).filter(
+            PerformanceMetric.user_id == user_id,
+            PerformanceMetric.metric_type == 'performance',
+            PerformanceMetric.measurement_date >= cutoff_date
+        ).all()
+        
+        if not metrics:
+            return {'average': 0.5, 'trend': 'stable', 'improvement': 0.0}
+        
+        performance_values = [m.metric_value for m in metrics]
+        avg_performance = np.mean(performance_values)
+        trend = self._calculate_trend(performance_values)
+        improvement = performance_values[-1] - performance_values[0] if len(performance_values) > 1 else 0.0
+        
+        return {
+            'average': avg_performance,
+            'trend': 'improving' if trend > 0.1 else 'declining' if trend < -0.1 else 'stable',
+            'improvement': improvement,
+            'consistency': 1.0 - np.std(performance_values) if len(performance_values) > 1 else 1.0
+        }
+    
+    async def _calculate_learning_velocity(self, user_id: str, days_back: int = 30) -> Dict:
+        """Calculate learning velocity metrics"""
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+        
+        metrics = self.db.query(PerformanceMetric).filter(
+            PerformanceMetric.user_id == user_id,
+            PerformanceMetric.metric_type == 'learning_velocity',
+            PerformanceMetric.measurement_date >= cutoff_date
+        ).all()
+        
+        if not metrics:
+            return {'velocity': 0.0, 'acceleration': 0.0, 'learning_rate': 'moderate'}
+        
+        velocity_values = [m.metric_value for m in metrics]
+        avg_velocity = np.mean(velocity_values)
+        
+        # Calculate acceleration (second derivative)
+        acceleration = 0.0
+        if len(velocity_values) > 2:
+            acceleration = np.gradient(np.gradient(velocity_values))[-1]
+        
+        learning_rate = 'fast' if avg_velocity > 0.7 else 'slow' if avg_velocity < 0.3 else 'moderate'
+        
+        return {
+            'velocity': avg_velocity,
+            'acceleration': acceleration,
+            'learning_rate': learning_rate,
+            'consistency': 1.0 - np.std(velocity_values) if len(velocity_values) > 1 else 1.0
+        }
+    
+    async def _calculate_retention_metrics(self, user_id: str, days_back: int = 30) -> Dict:
+        """Calculate knowledge retention metrics"""
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+        
+        interactions = self.db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id,
+            UserInteraction.timestamp >= cutoff_date
+        ).order_by(UserInteraction.timestamp.asc()).all()
+        
+        if not interactions:
+            return {'retention_score': 0.5, 'knowledge_decay': 0.0}
+        
+        # Calculate retention based on repeated topics and performance over time
+        topic_performance = {}
+        for interaction in interactions:
+            topic = interaction.topic or 'general'
+            rating = interaction.user_rating or 3
+            
+            if topic not in topic_performance:
+                topic_performance[topic] = []
+            topic_performance[topic].append(rating)
+        
+        retention_scores = []
+        for topic, ratings in topic_performance.items():
+            if len(ratings) > 1:
+                # Check if performance is maintained or improved over time
+                trend = self._calculate_trend(ratings)
+                retention_score = 0.5 + (trend * 0.5)  # Convert trend to retention score
+                retention_scores.append(max(0.0, min(1.0, retention_score)))
+        
+        avg_retention = np.mean(retention_scores) if retention_scores else 0.5
+        
+        return {
+            'retention_score': avg_retention,
+            'knowledge_decay': max(0.0, 0.5 - avg_retention),
+            'topics_tracked': len(topic_performance),
+            'repeat_learning_needed': avg_retention < 0.4
+        }
+    
+    async def _calculate_satisfaction_metrics(self, user_id: str, days_back: int = 30) -> Dict:
+        """Calculate user satisfaction metrics"""
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+        
+        interactions = self.db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id,
+            UserInteraction.timestamp >= cutoff_date,
+            UserInteraction.user_rating.isnot(None)
+        ).all()
+        
+        if not interactions:
+            return {'satisfaction': 0.5, 'trend': 'stable', 'consistency': 0.5}
+        
+        ratings = [interaction.user_rating for interaction in interactions]
+        avg_satisfaction = np.mean(ratings) / 5.0  # Normalize to 0-1
+        trend = self._calculate_trend(ratings)
+        consistency = 1.0 - (np.std(ratings) / 5.0) if len(ratings) > 1 else 1.0
+        
+        return {
+            'satisfaction': avg_satisfaction,
+            'trend': 'improving' if trend > 0.2 else 'declining' if trend < -0.2 else 'stable',
+            'consistency': consistency,
+            'total_ratings': len(ratings),
+            'high_satisfaction_rate': len([r for r in ratings if r >= 4]) / len(ratings)
+        }
+    
     async def get_user_analytics(self, user_id: str, days_back: int = 30) -> Dict:
         cutoff_date = datetime.utcnow() - timedelta(days=days_back)
         

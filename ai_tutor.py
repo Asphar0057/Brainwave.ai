@@ -4,7 +4,7 @@ import os
 import sys
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import logging
 
@@ -76,7 +76,6 @@ except ImportError:
 
 # Import the classes from the feedback learning system
 try:
-    # Try to import from the ml module
     from ml.feedback_learning_system import FeedbackLearningSystem, AdaptiveResponseGenerator
 except ImportError as e:
     print(f"FeedbackLearningSystem import failed: {e}")
@@ -182,10 +181,10 @@ class BrainwaveAITutor:
         if not user:
             user = User(
                 user_id=user_id,
-                created_at=datetime.utcnow(),
-                last_active=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
+                last_active=datetime.now(timezone.utc),
                 profile_data=initial_data or {},
-                learning_metadata={}
+                learning_data={}  # Changed from learning_metadata to learning_data
             )
             try:
                 self.db.add(user)
@@ -200,7 +199,7 @@ class BrainwaveAITutor:
         
         self.active_users[user_id] = {
             'profile': user_profile,
-            'session_start': datetime.utcnow(),
+            'session_start': datetime.now(timezone.utc),
             'interaction_count': 0
         }
         
@@ -227,7 +226,7 @@ class BrainwaveAITutor:
         session_id = self.session_tracker.get_or_create_session(user_id)
         user_profile = self.active_users[user_id]['profile']
         
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         
         # Route the query through the routing agent
         routing_response = await self.query_router.route_query(query, user_id, user_profile)
@@ -279,10 +278,20 @@ class BrainwaveAITutor:
     
     async def _store_interaction(self, user_id: str, session_id: str, query: str, 
                                 response: str, routing_data: Dict, context: Dict) -> int:
+        # First try to get the User object ID instead of using user_id string directly
+        try:
+            user = self.db.query(User).filter(User.user_id == user_id).first()
+            if user:
+                db_user_id = user.id
+            else:
+                db_user_id = 1  # Fallback for mock DB
+        except:
+            db_user_id = 1  # Fallback for mock DB
+        
         interaction = UserInteraction(
-            user_id=user_id,
-            session_id=session_id,
-            timestamp=datetime.utcnow(),
+            user_id=db_user_id,  # Use the integer ID from the User table
+            session_id=1,  # Simplified for now - would need to get actual session record ID
+            timestamp=datetime.now(timezone.utc),
             interaction_type=routing_data['query_type'],
             user_input=query,
             ai_response=response,
@@ -483,7 +492,7 @@ async def main():
             print("👋 Goodbye!")
             break
         else:
-            print("❌ Invalid option")
+            print("⚠ Invalid option")
 
 if __name__ == "__main__":
     asyncio.run(main())

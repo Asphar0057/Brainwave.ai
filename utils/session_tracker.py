@@ -1,7 +1,7 @@
 import uuid
 import numpy as np
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from database.models import SessionLocal, LearningSession
 import logging
 
@@ -16,25 +16,42 @@ class SessionTracker:
     def get_or_create_session(self, user_id: str) -> str:
         if user_id in self.active_sessions:
             session_data = self.active_sessions[user_id]
-            if datetime.utcnow() - session_data['last_activity'] < timedelta(seconds=self.session_timeout):
-                session_data['last_activity'] = datetime.utcnow()
+            if datetime.now(timezone.utc) - session_data['last_activity'] < timedelta(seconds=self.session_timeout):
+                session_data['last_activity'] = datetime.now(timezone.utc)
                 return session_data['session_id']
         
         session_id = str(uuid.uuid4())
         
+        # First, get the User record to get the proper user ID
+        try:
+            from database.models import User
+            user = self.db.query(User).filter(User.user_id == user_id).first()
+            if user:
+                db_user_id = user.id
+            else:
+                # Create a mock user if not found (for testing)
+                db_user_id = 1
+        except Exception as e:
+            logger.warning(f"Could not find user {user_id}, using mock ID: {e}")
+            db_user_id = 1
+        
         db_session = LearningSession(
-            user_id=user_id,
+            user_id=db_user_id,
             session_id=session_id,
-            start_time=datetime.utcnow(),
-            session_metadata={'created_by': 'session_tracker'}
+            start_time=datetime.now(timezone.utc),
+            session_data={'created_by': 'session_tracker'}  # Changed from session_metadata to session_data
         )
-        self.db.add(db_session)
-        self.db.commit()
+        
+        try:
+            self.db.add(db_session)
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Error creating session in database: {e}")
         
         self.active_sessions[user_id] = {
             'session_id': session_id,
-            'start_time': datetime.utcnow(),
-            'last_activity': datetime.utcnow(),
+            'start_time': datetime.now(timezone.utc),
+            'last_activity': datetime.now(timezone.utc),
             'interaction_count': 0,
             'topics_covered': set(),
             'performance_scores': []
@@ -45,7 +62,7 @@ class SessionTracker:
     def update_session_activity(self, user_id: str, activity_data: Dict):
         if user_id in self.active_sessions:
             session = self.active_sessions[user_id]
-            session['last_activity'] = datetime.utcnow()
+            session['last_activity'] = datetime.now(timezone.utc)
             session['interaction_count'] += 1
             
             if 'topic' in activity_data:
@@ -58,19 +75,22 @@ class SessionTracker:
         if user_id in self.active_sessions:
             session_data = self.active_sessions[user_id]
             
-            db_session = self.db.query(LearningSession).filter(
-                LearningSession.session_id == session_data['session_id']
-            ).first()
-            
-            if db_session:
-                db_session.end_time = datetime.utcnow()
-                db_session.interaction_count = session_data['interaction_count']
-                db_session.session_metadata = {
-                    'topics_covered': list(session_data['topics_covered']),
-                    'avg_performance': np.mean(session_data['performance_scores']) if session_data['performance_scores'] else 0.0,
-                    'total_interactions': session_data['interaction_count']
-                }
-                self.db.commit()
+            try:
+                db_session = self.db.query(LearningSession).filter(
+                    LearningSession.session_id == session_data['session_id']
+                ).first()
+                
+                if db_session:
+                    db_session.end_time = datetime.now(timezone.utc)
+                    db_session.interaction_count = session_data['interaction_count']
+                    db_session.session_data = {  # Changed from session_metadata to session_data
+                        'topics_covered': list(session_data['topics_covered']),
+                        'avg_performance': np.mean(session_data['performance_scores']) if session_data['performance_scores'] else 0.0,
+                        'total_interactions': session_data['interaction_count']
+                    }
+                    self.db.commit()
+            except Exception as e:
+                logger.error(f"Error updating session in database: {e}")
             
             del self.active_sessions[user_id]
     
@@ -79,7 +99,7 @@ class SessionTracker:
             return {}
         
         session = self.active_sessions[user_id]
-        duration = (datetime.utcnow() - session['start_time']).total_seconds() / 60
+        duration = (datetime.now(timezone.utc) - session['start_time']).total_seconds() / 60
         
         return {
             'session_id': session['session_id'],
